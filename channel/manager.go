@@ -56,10 +56,15 @@ func (m *Manager) Unsubscribe(channelName, connID string) {
 	isEmpty := len(channel.subscribers) == 0
 	channel.mux.Unlock()
 
-	// Clean up empty channels
 	if isEmpty {
 		m.mux.Lock()
-		delete(m.channels, channelName)
+		if ch, exists := m.channels[channelName]; exists {
+			ch.mux.Lock()
+			if len(ch.subscribers) == 0 {
+				delete(m.channels, channelName)
+			}
+			ch.mux.Unlock()
+		}
 		m.mux.Unlock()
 	}
 }

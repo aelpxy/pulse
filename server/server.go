@@ -169,12 +169,46 @@ func (s *Server) HandleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 3 {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	appID := parts[1]
+
+	var targetApp *apps.App
+	for _, app := range s.appsManager.GetAllApps() {
+		if app.ID == appID {
+			targetApp = app
+			break
+		}
+	}
+	if targetApp == nil {
+		http.Error(w, "App not found", http.StatusNotFound)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body", http.StatusBadRequest)
 		return
 	}
 	defer r.Body.Close()
+
+	s.authMux.RLock()
+	authSvc, exists := s.authServices[targetApp.Key]
+	s.authMux.RUnlock()
+
+	if !exists {
+		http.Error(w, "Authentication service not found", http.StatusInternalServerError)
+		return
+	}
+
+	if err := authSvc.ValidateHTTPRequest(r.Method, r.URL.Path, r.URL.Query(), body); err != nil {
+		log.Warn("authentication failed", "error", err, "app", targetApp.Key, "path", r.URL.Path)
+		http.Error(w, fmt.Sprintf("Authentication failed: %v", err), http.StatusUnauthorized)
+		return
+	}
 
 	type TriggerRequest struct {
 		Name     string   `json:"name"`
@@ -196,7 +230,10 @@ func (s *Server) HandleEvents(w http.ResponseWriter, r *http.Request) {
 
 	for _, ch := range channels {
 		var data any
-		json.Unmarshal([]byte(trigger.Data), &data)
+		if err := json.Unmarshal([]byte(trigger.Data), &data); err != nil {
+			log.Warn("failed to parse event data", "error", err, "channel", ch)
+			continue
+		}
 		s.connectionMgr.PublishToChannel(ch, trigger.Name, data)
 	}
 
@@ -236,6 +273,21 @@ func (s *Server) HandleBatchEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	s.authMux.RLock()
+	authSvc, exists := s.authServices[targetApp.Key]
+	s.authMux.RUnlock()
+
+	if !exists {
+		http.Error(w, "Authentication service not found", http.StatusInternalServerError)
+		return
+	}
+
+	if err := authSvc.ValidateHTTPRequest(r.Method, r.URL.Path, r.URL.Query(), body); err != nil {
+		log.Warn("authentication failed", "error", err, "app", targetApp.Key, "path", r.URL.Path)
+		http.Error(w, fmt.Sprintf("Authentication failed: %v", err), http.StatusUnauthorized)
+		return
+	}
+
 	type BatchEvent struct {
 		Name    string `json:"name"`
 		Channel string `json:"channel"`
@@ -268,7 +320,9 @@ func (s *Server) HandleBatchEvents(w http.ResponseWriter, r *http.Request) {
 
 	for i, event := range batchReq.Batch {
 		var data any
-		json.Unmarshal([]byte(event.Data), &data)
+		if err := json.Unmarshal([]byte(event.Data), &data); err != nil {
+			log.Warn("failed to parse event data", "error", err, "channel", event.Channel, "event", event.Name)
+		}
 
 		s.connectionMgr.PublishToChannel(event.Channel, event.Name, data)
 
@@ -341,13 +395,22 @@ func (s *Server) ReloadApps(configFile string) error {
 		return fmt.Errorf("failed to reload apps: %w", err)
 	}
 
+	// Update auth services
 	s.authMux.Lock()
 	s.authServices = make(map[string]*auth.Service)
 	for _, app := range newAppsMgr.GetAllApps() {
 		s.authServices[app.Key] = auth.NewService(app.Key, app.Secret)
 	}
+	authServicesCopy := make(map[string]*auth.Service)
+	for k, v := range s.authServices {
+		authServicesCopy[k] = v
+	}
 	s.authMux.Unlock()
 
+	// Update connection manager's auth services
+	s.connectionMgr.SetAuthServices(authServicesCopy)
+
+	// Update apps manager (thread-safe as it's only read after startup)
 	s.appsManager = newAppsMgr
 
 	log.Info("reloaded apps", "count", newAppsMgr.GetAppCount())
