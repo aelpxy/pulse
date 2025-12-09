@@ -47,7 +47,7 @@ func (s *Service) GenerateAuthString(socketID, channel string, channelData *stri
 
 func (s *Service) ValidateAuth(authString, socketID, channel string, channelData *string) bool {
 	expectedAuth := s.GenerateAuthString(socketID, channel, channelData)
-	return authString == expectedAuth
+	return hmac.Equal([]byte(authString), []byte(expectedAuth))
 }
 
 func ParseAuthString(authString string) (appKey, signature string, err error) {
@@ -107,7 +107,7 @@ func (s *Service) ValidateHTTPRequest(method, path string, queryParams url.Value
 
 	expectedSignature := s.GenerateHTTPSignature(method, path, queryParams)
 
-	if authSignature != expectedSignature {
+	if !hmac.Equal([]byte(authSignature), []byte(expectedSignature)) {
 		return fmt.Errorf("invalid auth_signature")
 	}
 
