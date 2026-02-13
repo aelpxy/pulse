@@ -21,11 +21,13 @@ import (
 
 var (
 	ErrMaxConnectionsReached = errors.New("maximum connections reached")
+	ErrAppMaxConnections     = errors.New("app maximum connections reached")
 	ErrServerShutdown        = errors.New("server is shutting down")
 )
 
 type Manager struct {
 	connections     map[string]*Connection
+	appConnCount    map[string]int
 	connectionsMux  sync.RWMutex
 	channelManager  *channel.Manager
 	presenceManager *presence.Manager
@@ -51,6 +53,7 @@ func NewManager(channelManager *channel.Manager, authService *auth.Service, maxC
 
 	m := &Manager{
 		connections:     make(map[string]*Connection),
+		appConnCount:    make(map[string]int),
 		channelManager:  channelManager,
 		presenceManager: presence.NewManager(),
 		authService:     authService,
@@ -86,14 +89,15 @@ func (m *Manager) cleanupInactiveConnections() {
 			now := time.Now()
 
 			for _, conn := range m.connections {
-				if now.Sub(conn.lastActivity) > maxInactivity {
+				lastActivity := conn.LastActivity()
+				if !lastActivity.IsZero() && now.Sub(lastActivity) > maxInactivity {
 					toClose = append(toClose, conn)
 				}
 			}
 			m.connectionsMux.RUnlock()
 
 			for _, conn := range toClose {
-				log.Debug("closing inactive connection", "id", conn.ID, "last_activity", conn.lastActivity)
+				log.Debug("closing inactive connection", "id", conn.ID, "last_activity", conn.LastActivity())
 				// send error before closing (code 4202: closed after inactivity)
 				code := protocol.ErrorClosedAfterInactivityTimeout
 				errMsg, err := protocol.NewError("Connection closed due to inactivity", &code)
@@ -156,8 +160,23 @@ func (m *Manager) RegisterWithApp(ws *websocket.Conn, appKey string) (*Connectio
 		}
 	}
 
+	appMaxConnections := 0
+	if appKey != "" && m.appsManager != nil {
+		if app, exists := m.appsManager.GetApp(appKey); exists {
+			appMaxConnections = app.MaxConnections
+		}
+	}
+
 	m.connectionsMux.Lock()
+	if appMaxConnections > 0 && m.appConnCount[appKey] >= appMaxConnections {
+		m.connectionsMux.Unlock()
+		<-m.connectionSem
+		return nil, ErrAppMaxConnections
+	}
 	m.connections[socketID] = conn
+	if appKey != "" {
+		m.appConnCount[appKey]++
+	}
 	atomic.AddInt64(&m.currentConnections, 1)
 	currentConns := atomic.LoadInt64(&m.currentConnections)
 	m.connectionsMux.Unlock()
@@ -189,6 +208,13 @@ func (m *Manager) Unregister(conn *Connection) {
 	_, exists := m.connections[conn.ID]
 	if exists {
 		delete(m.connections, conn.ID)
+		if conn.AppKey != "" {
+			if count := m.appConnCount[conn.AppKey]; count <= 1 {
+				delete(m.appConnCount, conn.AppKey)
+			} else {
+				m.appConnCount[conn.AppKey] = count - 1
+			}
+		}
 		atomic.AddInt64(&m.currentConnections, -1)
 		log.Debug("connection unregistered", "id", conn.ID, "active_connections", atomic.LoadInt64(&m.currentConnections))
 	}
@@ -232,8 +258,27 @@ func (m *Manager) GetConnection(id string) (*Connection, bool) {
 
 func (m *Manager) SubscribeConnection(conn *Connection, subData *protocol.SubscribeData) {
 	channelName := subData.Channel
+	isPresence := protocol.IsPresenceChannel(channelName)
+	var presenceMember *presence.Member
 
-	if protocol.IsPrivateChannel(channelName) || protocol.IsPresenceChannel(channelName) || protocol.IsEncryptedChannel(channelName) {
+	if isPresence {
+		if subData.ChannelData != nil && *subData.ChannelData != "" {
+			member, err := presence.ParseChannelData(*subData.ChannelData)
+			if err != nil {
+				code := protocol.ErrorConnectionIsUnauthorized
+				conn.sendError("Invalid channel_data for presence channel", &code)
+				return
+			}
+			presenceMember = member
+		} else {
+			presenceMember = &presence.Member{
+				UserID:   conn.ID,
+				UserInfo: nil,
+			}
+		}
+	}
+
+	if protocol.IsPrivateChannel(channelName) || isPresence || protocol.IsEncryptedChannel(channelName) {
 		if subData.Auth == nil {
 			code := protocol.ErrorConnectionIsUnauthorized
 			conn.sendError("Authentication required for private/presence channels", &code)
@@ -253,6 +298,16 @@ func (m *Manager) SubscribeConnection(conn *Connection, subData *protocol.Subscr
 		}
 	}
 
+	if m.appsManager != nil {
+		if app, exists := m.appsManager.GetApp(conn.AppKey); exists && app.MaxChannelsPerConn > 0 {
+			if !conn.IsSubscribed(channelName) && len(conn.GetChannels()) >= app.MaxChannelsPerConn {
+				code := protocol.ErrorConnectionIsUnauthorized
+				conn.sendError("Connection channel limit exceeded", &code)
+				return
+			}
+		}
+	}
+
 	if err := m.channelManager.Subscribe(channelName, conn.ID); err != nil {
 		conn.sendError(fmt.Sprintf("Failed to subscribe: %v", err), nil)
 		return
@@ -260,26 +315,10 @@ func (m *Manager) SubscribeConnection(conn *Connection, subData *protocol.Subscr
 
 	conn.Subscribe(channelName)
 
-	if protocol.IsPresenceChannel(channelName) {
-		var member *presence.Member
-		if subData.ChannelData != nil && *subData.ChannelData != "" {
-			var err error
-			member, err = presence.ParseChannelData(*subData.ChannelData)
-			if err != nil {
-				code := protocol.ErrorConnectionIsUnauthorized
-				conn.sendError("Invalid channel_data for presence channel", &code)
-				return
-			}
-		} else {
-			member = &presence.Member{
-				UserID:   conn.ID,
-				UserInfo: nil,
-			}
-		}
+	if isPresence {
+		m.presenceManager.AddMember(channelName, conn.ID, presenceMember)
 
-		m.presenceManager.AddMember(channelName, conn.ID, member)
-
-		memberAddedMsg, err := protocol.NewMemberAdded(channelName, member)
+		memberAddedMsg, err := protocol.NewMemberAdded(channelName, presenceMember)
 		if err == nil {
 			m.BroadcastToChannel(channelName, memberAddedMsg, conn.ID)
 		}

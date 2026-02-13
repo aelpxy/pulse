@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aelpxy/pulse/protocol"
@@ -27,7 +28,7 @@ type Connection struct {
 	manager         *Manager
 	channels        map[string]bool
 	channelsMux     sync.RWMutex
-	lastActivity    time.Time
+	lastActivityNS  atomic.Int64
 	activityTimeout time.Duration
 	closing         chan struct{}
 	closeMux        sync.Mutex
@@ -37,18 +38,19 @@ type Connection struct {
 }
 
 func NewConnection(id string, ws *websocket.Conn, manager *Manager, activityTimeout time.Duration) *Connection {
-	return &Connection{
+	conn := &Connection{
 		ID:              id,
 		ws:              ws,
 		send:            make(chan []byte, 512),
 		manager:         manager,
 		channels:        make(map[string]bool),
-		lastActivity:    time.Now(),
 		activityTimeout: activityTimeout,
 		closing:         make(chan struct{}),
 		isClosed:        false,
 		rateLimiter:     rate.NewLimiter(10, 20), // default, updated per app config
 	}
+	conn.touchActivity()
+	return conn
 }
 
 func (c *Connection) SetRateLimit(eventsPerSecond int, burst int) {
@@ -64,7 +66,7 @@ func (c *Connection) ReadPump() {
 	c.ws.SetReadDeadline(time.Now().Add(c.activityTimeout))
 
 	c.ws.SetPongHandler(func(string) error {
-		c.lastActivity = time.Now()
+		c.touchActivity()
 		c.ws.SetReadDeadline(time.Now().Add(c.activityTimeout))
 		return nil
 	})
@@ -80,10 +82,22 @@ func (c *Connection) ReadPump() {
 			break
 		}
 
-		c.lastActivity = time.Now()
+		c.touchActivity()
 
 		c.handleMessage(message)
 	}
+}
+
+func (c *Connection) touchActivity() {
+	c.lastActivityNS.Store(time.Now().UnixNano())
+}
+
+func (c *Connection) LastActivity() time.Time {
+	ns := c.lastActivityNS.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 func (c *Connection) WritePump() {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -130,7 +131,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := s.connectionMgr.RegisterWithApp(ws, appKey)
 	if err != nil {
-		if err == connection.ErrMaxConnectionsReached {
+		if errors.Is(err, connection.ErrMaxConnectionsReached) || errors.Is(err, connection.ErrAppMaxConnections) {
 			log.Warn("max connections reached", "app", appKey)
 			ws.WriteMessage(1, []byte(`{"event":"pusher:error","data":{"message":"Over capacity","code":4100}}`))
 		} else {
